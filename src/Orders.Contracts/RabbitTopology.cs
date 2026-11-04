@@ -15,7 +15,7 @@ public static class RabbitTopology
             Exchange, ExchangeType.Direct, durable: true, autoDelete: false, cancellationToken: ct
         );
         await channel.QueueDeclareAsync(
-            ProcessQueue, durable: true, exclusive: true, autoDelete: false, cancellationToken: ct
+            ProcessQueue, durable: true, exclusive: false, autoDelete: false, cancellationToken: ct
         );
         await channel.QueueBindAsync(
             ProcessQueue, Exchange, OrderCreatedKey, cancellationToken: ct
