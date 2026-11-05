@@ -6,12 +6,14 @@ using Orders.Contracts;
 using Orders.Data;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
+using StackExchange.Redis;
 
 namespace Orders.Worker;
 
 public sealed class OrderConsumer(
     IOptions<RabbitMqOptions> options,
     IDbContextFactory<OrdersDbContext> dbFactory,
+    IConnectionMultiplexer redis,
     ILogger<OrderConsumer> logger) : BackgroundService
 {
     private const int MaxAttempts = 3;
@@ -75,6 +77,7 @@ public sealed class OrderConsumer(
             order.Attempts = (int)attempt;
             order.UpdatedAtUtc = DateTime.UtcNow;
             await db.SaveChangesAsync(ct);
+            await InvalidateCacheAsync(order.Id);
 
             await ProcessAsync(message, failures, ct);
 
@@ -82,6 +85,7 @@ public sealed class OrderConsumer(
             order.LastError = null;
             order.UpdatedAtUtc = DateTime.UtcNow;
             await db.SaveChangesAsync(ct);
+            await InvalidateCacheAsync(order.Id);
 
             await channel.BasicAckAsync(deliveryTag: ea.DeliveryTag, multiple: false, cancellationToken: ct);
 
@@ -124,6 +128,21 @@ public sealed class OrderConsumer(
         }
     }
 
+    private async Task InvalidateCacheAsync(Guid orderId)
+    {
+        try
+        {
+            await redis.GetDatabase().KeyDeleteAsync(CacheKeys.Order(orderId));
+            logger.LogInformation("Cache do pedido {OrderId} invalidado", orderId);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(
+                "Não foi possível invalidar o cache do pedido {OrderId}: {Error}",
+                orderId, ex.Message);
+        }
+    }
+
     private async Task TryRecordFailureAsync(
         Guid orderId,
         long attempt,
@@ -147,6 +166,7 @@ public sealed class OrderConsumer(
             order.UpdatedAtUtc = DateTime.UtcNow;
 
             await db.SaveChangesAsync(ct);
+            await InvalidateCacheAsync(orderId);
         }
         catch (Exception dbEx)
         {
