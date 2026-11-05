@@ -1,7 +1,9 @@
 using System.Text;
 using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using Orders.Contracts;
+using Orders.Data;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 
@@ -9,6 +11,7 @@ namespace Orders.Worker;
 
 public sealed class OrderConsumer(
     IOptions<RabbitMqOptions> options,
+    IDbContextFactory<OrdersDbContext> dbFactory,
     ILogger<OrderConsumer> logger) : BackgroundService
 {
     private const int MaxAttempts = 3;
@@ -43,35 +46,64 @@ public sealed class OrderConsumer(
 
     private async Task HandleAsync(IChannel channel, BasicDeliverEventArgs ea, CancellationToken ct)
     {
-        var order = JsonSerializer.Deserialize<OrderCreated>(ea.Body.Span)!;
+        var message = JsonSerializer.Deserialize<OrderCreated>(ea.Body.Span)!;
         var failures = GetFailureCount(ea.BasicProperties);
         var attempt = failures + 1;
 
         logger.LogInformation(
             "Recebido pedido {OrderId} (Attempt={Attempt}, MessageId={MessageId}, FailureMode={FailureMode})",
-            order.OrderId, attempt, order.MessageId, order.FailureMode);
+            message.OrderId, attempt, message.MessageId, message.FailureMode);
 
         try
         {
-            await ProcessAsync(order, failures, ct);
+            await using var db = await dbFactory.CreateDbContextAsync(ct);
+
+            var order = await db.Orders.FirstOrDefaultAsync(o => o.Id == message.OrderId, ct)
+                ?? throw new InvalidOperationException($"Pedido {message.OrderId} não encontrado no banco");
+
+            if (order.Status == OrderStatus.Completed)
+            {
+                logger.LogWarning(
+                    "Pedido {OrderId} já estava concluído; mensagem duplicada ignorada",
+                    order.Id);
+
+                await channel.BasicAckAsync(deliveryTag: ea.DeliveryTag, multiple: false, cancellationToken: ct);
+                return;
+            }
+
+            order.Status = OrderStatus.Processing;
+            order.Attempts = (int)attempt;
+            order.UpdatedAtUtc = DateTime.UtcNow;
+            await db.SaveChangesAsync(ct);
+
+            await ProcessAsync(message, failures, ct);
+
+            order.Status = OrderStatus.Completed;
+            order.LastError = null;
+            order.UpdatedAtUtc = DateTime.UtcNow;
+            await db.SaveChangesAsync(ct);
 
             await channel.BasicAckAsync(deliveryTag: ea.DeliveryTag, multiple: false, cancellationToken: ct);
 
-            logger.LogInformation("Pedido {OrderId} concluído e confirmado (ack)", order.OrderId);
+            logger.LogInformation("Pedido {OrderId} concluído e confirmado (ack)", order.Id);
         }
         catch (OperationCanceledException)
         {
             logger.LogWarning(
                 "Worker interrompido durante o pedido {OrderId}; sem ack, a mensagem volta para a fila",
-                order.OrderId);
+                message.OrderId);
         }
         catch (Exception ex)
         {
-            if (attempt >= MaxAttempts)
+            var exhausted = attempt >= MaxAttempts;
+
+            await TryRecordFailureAsync(message.OrderId, attempt, ex.Message, exhausted, ct);
+
+            if (exhausted)
             {
                 logger.LogError(
                     "Pedido {OrderId} esgotou {Attempts} tentativas: {Error}. Enviando para a parking queue",
-                    order.OrderId, attempt, ex.Message);
+                    message.OrderId, attempt, ex.Message);
 
                 await SendToParkingAsync(channel, ea, attempt, ex.Message, ct);
 
@@ -81,7 +113,7 @@ public sealed class OrderConsumer(
             {
                 logger.LogWarning(
                     "Falha na tentativa {Attempt} do pedido {OrderId}: {Error}. Enviando para a fila de retry",
-                    attempt, order.OrderId, ex.Message);
+                    attempt, message.OrderId, ex.Message);
 
                 await channel.BasicNackAsync(
                     deliveryTag: ea.DeliveryTag,
@@ -89,6 +121,38 @@ public sealed class OrderConsumer(
                     requeue: false,
                     cancellationToken: ct);
             }
+        }
+    }
+
+    private async Task TryRecordFailureAsync(
+        Guid orderId,
+        long attempt,
+        string error,
+        bool exhausted,
+        CancellationToken ct)
+    {
+        try
+        {
+            await using var db = await dbFactory.CreateDbContextAsync(ct);
+
+            var order = await db.Orders.FirstOrDefaultAsync(o => o.Id == orderId, ct);
+            if (order is null)
+            {
+                return;
+            }
+
+            order.Status = exhausted ? OrderStatus.Failed : OrderStatus.Retrying;
+            order.Attempts = (int)attempt;
+            order.LastError = error.Length > 1000 ? error[..1000] : error;
+            order.UpdatedAtUtc = DateTime.UtcNow;
+
+            await db.SaveChangesAsync(ct);
+        }
+        catch (Exception dbEx)
+        {
+            logger.LogError(
+                "Não foi possível registrar a falha do pedido {OrderId} no banco: {Error}",
+                orderId, dbEx.Message);
         }
     }
 
