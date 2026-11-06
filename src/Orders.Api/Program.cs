@@ -5,8 +5,19 @@ using Orders.Contracts;
 using Orders.Data;
 using RabbitMQ.Client;
 using StackExchange.Redis;
+using Serilog;
+using Serilog.Events;
 
 var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddSerilog((services, logger) => logger
+    .MinimumLevel.Information()
+    .MinimumLevel.Override("Microsoft.AspNetCore", LogEventLevel.Warning)
+    .MinimumLevel.Override("Microsoft.EntityFrameworkCore", LogEventLevel.Warning)
+    .Enrich.FromLogContext()
+    .Enrich.WithProperty("Application", "Orders.Api")
+    .WriteTo.Console()
+    .WriteTo.Seq(builder.Configuration["Seq:ServerUrl"]!));
 
 builder.Services.AddDbContext<OrdersDbContext>(options =>
     options.UseNpgsql(builder.Configuration.GetConnectionString("Orders")));
@@ -28,6 +39,8 @@ await using (var setupChannel = await connection.CreateChannelAsync())
 builder.Services.AddSingleton(connection);
 
 var app = builder.Build();
+
+app.UseSerilogRequestLogging();
 
 app.MapPost("/orders", async (
     CreateOrderRequest request,
