@@ -4,9 +4,10 @@ using Microsoft.EntityFrameworkCore;
 using Orders.Contracts;
 using Orders.Data;
 using RabbitMQ.Client;
-using StackExchange.Redis;
 using Serilog;
+using Serilog.Context;
 using Serilog.Events;
+using StackExchange.Redis;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -40,11 +41,30 @@ builder.Services.AddSingleton(connection);
 
 var app = builder.Build();
 
+app.Use(async (context, next) =>
+{
+    var correlationId = context.Request.Headers["X-Correlation-Id"].FirstOrDefault();
+
+    if (string.IsNullOrWhiteSpace(correlationId) || correlationId.Length > 100)
+    {
+        correlationId = Guid.NewGuid().ToString();
+    }
+
+    context.Items["CorrelationId"] = correlationId;
+    context.Response.Headers["X-Correlation-Id"] = correlationId;
+
+    using (LogContext.PushProperty("CorrelationId", correlationId))
+    {
+        await next();
+    }
+});
+
 app.UseSerilogRequestLogging();
 
 app.MapPost("/orders", async (
     CreateOrderRequest request,
     [FromHeader(Name = "Idempotency-Key")] string? idempotencyKey,
+    HttpContext http,
     IConnection conn,
     OrdersDbContext db,
     IConnectionMultiplexer redis,
@@ -116,6 +136,7 @@ app.MapPost("/orders", async (
         {
             Persistent = true,
             MessageId = message.MessageId.ToString(),
+            CorrelationId = http.Items["CorrelationId"]?.ToString(),
             ContentType = "application/json"
         };
 
@@ -127,6 +148,10 @@ app.MapPost("/orders", async (
             mandatory: false,
             basicProperties: props,
             body: body);
+
+        logger.LogInformation(
+            "Pedido {OrderId} publicado (MessageId={MessageId}, FailureMode={FailureMode})",
+            order.Id, message.MessageId, order.FailureMode);
 
         return Results.Accepted($"/orders/{order.Id}", new { OrderId = order.Id });
     }

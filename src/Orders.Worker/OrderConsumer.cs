@@ -6,6 +6,7 @@ using Orders.Contracts;
 using Orders.Data;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
+using Serilog.Context;
 using StackExchange.Redis;
 
 namespace Orders.Worker;
@@ -51,6 +52,9 @@ public sealed class OrderConsumer(
         var message = JsonSerializer.Deserialize<OrderCreated>(ea.Body.Span)!;
         var failures = GetFailureCount(ea.BasicProperties);
         var attempt = failures + 1;
+
+        var correlationId = ea.BasicProperties.CorrelationId ?? "sem-correlation-id";
+        using var correlationScope = LogContext.PushProperty("CorrelationId", correlationId);
 
         logger.LogInformation(
             "Recebido pedido {OrderId} (Attempt={Attempt}, MessageId={MessageId}, FailureMode={FailureMode})",
@@ -106,8 +110,9 @@ public sealed class OrderConsumer(
             if (exhausted)
             {
                 logger.LogError(
-                    "Pedido {OrderId} esgotou {Attempts} tentativas: {Error}. Enviando para a parking queue",
-                    message.OrderId, attempt, ex.Message);
+                    ex,
+                    "Pedido {OrderId} esgotou {Attempts} tentativas. Enviando para a parking queue",
+                    message.OrderId, attempt);
 
                 await SendToParkingAsync(channel, ea, attempt, ex.Message, ct);
 
@@ -187,6 +192,7 @@ public sealed class OrderConsumer(
         {
             Persistent = true,
             MessageId = ea.BasicProperties.MessageId,
+            CorrelationId = ea.BasicProperties.CorrelationId,
             ContentType = ea.BasicProperties.ContentType,
             Headers = new Dictionary<string, object?>
             {
