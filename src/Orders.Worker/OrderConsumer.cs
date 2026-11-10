@@ -1,4 +1,3 @@
-using System.Text;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
@@ -50,7 +49,7 @@ public sealed class OrderConsumer(
     private async Task HandleAsync(IChannel channel, BasicDeliverEventArgs ea, CancellationToken ct)
     {
         var message = JsonSerializer.Deserialize<OrderCreated>(ea.Body.Span)!;
-        var failures = GetFailureCount(ea.BasicProperties);
+        var failures = DeathHeaderReader.CountRejections(ea.BasicProperties.Headers, RabbitTopology.ProcessQueue);
         var attempt = failures + 1;
 
         var correlationId = ea.BasicProperties.CorrelationId ?? "sem-correlation-id";
@@ -103,7 +102,8 @@ public sealed class OrderConsumer(
         }
         catch (Exception ex)
         {
-            var exhausted = attempt >= MaxAttempts;
+            var decision = RetryPolicy.Decide(attempt, MaxAttempts);
+            var exhausted = decision == RetryDecision.Park;
 
             await TryRecordFailureAsync(message.OrderId, attempt, ex.Message, exhausted, ct);
 
@@ -208,34 +208,6 @@ public sealed class OrderConsumer(
             basicProperties: properties,
             body: ea.Body,
             cancellationToken: ct);
-    }
-
-    private static long GetFailureCount(IReadOnlyBasicProperties properties)
-    {
-        if (properties.Headers is null ||
-            !properties.Headers.TryGetValue("x-death", out var raw) ||
-            raw is not IList<object?> deaths)
-        {
-            return 0;
-        }
-
-        foreach (var item in deaths)
-        {
-            if (item is not IDictionary<string, object?> death)
-            {
-                continue;
-            }
-
-            var queue = Encoding.UTF8.GetString((byte[])death["queue"]!);
-            var reason = Encoding.UTF8.GetString((byte[])death["reason"]!);
-
-            if (queue == RabbitTopology.ProcessQueue && reason == "rejected")
-            {
-                return (long)death["count"]!;
-            }
-        }
-
-        return 0;
     }
 
     private static async Task ProcessAsync(OrderCreated order, long failures, CancellationToken ct)
