@@ -57,6 +57,9 @@ src/
 tests/
   Orders.UnitTests/
   Orders.IntegrationTests/
+Orders.slnx            solução (formato novo do .NET 10)
+docker-compose.yml     toda a infraestrutura e os dois serviços
+.github/workflows/     pipeline de CI
 ```
 
 ## Como rodar
@@ -128,7 +131,7 @@ Estados do pedido:
 
 | Status | Significado |
 | --- | --- |
-| `Pending` | Criado pela API, ainda não pego pelo worker. |
+| `Pending` | Criado pela API, ainda não recebido pelo worker. |
 | `Processing` | O worker está processando. |
 | `Completed` | Processado com sucesso. |
 | `Retrying` | Falhou e aguarda a próxima tentativa. |
@@ -141,7 +144,7 @@ Todas as exchanges são `direct` e duráveis, as filas são duráveis e as mensa
 | Item | Ligação | Argumentos e função |
 | --- | --- | --- |
 | Exchange `orders` | | Recebe os pedidos publicados pela API. |
-| Exchange `orders.dlx` | | Recebe as mensagens rejeitadas, expiradas ou enviadas ao parking. |
+| Exchange `orders.dlx` | | Recebe as mensagens rejeitadas pelo worker (nack) e as que ele envia ao parking, e as direciona para `orders.retry` ou `orders.parking`. As mensagens expiradas não passam por ela: o TTL vence na `orders.retry`, que as devolve à exchange `orders`. |
 | Fila `orders.process` | `orders` com a chave `order.created` | Fila principal, lida pelo worker. Em caso de nack, a mensagem vai para `orders.dlx` com a chave `order.retry`. |
 | Fila `orders.retry` | `orders.dlx` com a chave `order.retry` | Sem consumer. TTL de 10 segundos; ao expirar, a mensagem volta para `orders` com a chave `order.created`. |
 | Fila `orders.parking` | `orders.dlx` com a chave `order.parking` | Sem consumer. Guarda as mensagens que esgotaram as tentativas, com os cabeçalhos `x-attempts` e `x-last-error`. |
@@ -191,7 +194,7 @@ Crie um pedido `Slow` e, durante os 30 segundos, rode:
 docker compose stop worker
 ```
 
-A mensagem não foi confirmada, então o RabbitMQ a devolve à fila. Suba o worker de novo com `docker compose start worker`: a mensagem chega marcada como `Redelivered` e o pedido é processado.
+A mensagem não foi confirmada, então o RabbitMQ a devolve à fila. Suba o worker de novo com `docker compose start worker`: a mensagem é entregue de novo e o pedido é processado.
 
 ### 4. Idempotência na API
 
