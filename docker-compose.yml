@@ -37,16 +37,58 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-  seq: 
+
+  seq:
     image: datalust/seq:latest
     environment:
       ACCEPT_EULA: "Y"
       SEQ_FIRSTRUN_NOAUTHENTICATION: "true"
-    ports: 
+    ports:
       - "5341:5341"
       - "5340:80"
     volumes:
       - seq-data:/data
+
+  api:
+    build:
+      context: .
+      dockerfile: src/Orders.Api/Dockerfile
+    environment:
+      ASPNETCORE_ENVIRONMENT: "Development"
+      ConnectionStrings__Orders: "Host=postgres;Port=5432;Database=orders;Username=orders;Password=orders"
+      ConnectionStrings__Redis: "redis:6379"
+      RabbitMq__HostName: "rabbitmq"
+      Seq__ServerUrl: "http://seq:5341"
+    ports:
+      - "5080:8080"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      seq:
+        condition: service_started
+
+  worker:
+    build:
+      context: .
+      dockerfile: src/Orders.Worker/Dockerfile
+    environment:
+      ConnectionStrings__Orders: "Host=postgres;Port=5432;Database=orders;Username=orders;Password=orders"
+      ConnectionStrings__Redis: "redis:6379"
+      RabbitMq__HostName: "rabbitmq"
+      Seq__ServerUrl: "http://seq:5341"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      seq:
+        condition: service_started
 
 volumes:
   rabbitmq-data:

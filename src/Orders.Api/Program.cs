@@ -41,6 +41,12 @@ builder.Services.AddSingleton(connection);
 
 var app = builder.Build();
 
+await using (var scope = app.Services.CreateAsyncScope())
+{
+    var migrationDb = scope.ServiceProvider.GetRequiredService<OrdersDbContext>();
+    await migrationDb.Database.MigrateAsync();
+}
+
 app.Use(async (context, next) =>
 {
     var correlationId = context.Request.Headers["X-Correlation-Id"].FirstOrDefault();
@@ -65,6 +71,7 @@ app.MapPost("/orders", async (
     CreateOrderRequest request,
     [FromHeader(Name = "Idempotency-Key")] string? idempotencyKey,
     HttpContext http,
+    IWebHostEnvironment env,
     IConnection conn,
     OrdersDbContext db,
     IConnectionMultiplexer redis,
@@ -115,7 +122,7 @@ app.MapPost("/orders", async (
             Customer = request.Customer,
             Amount = request.Amount,
             Status = OrderStatus.Pending,
-            FailureMode = request.FailureMode ?? "None",
+            FailureMode = env.IsDevelopment() ? request.FailureMode ?? "None" : "None",
             CreatedAtUtc = DateTime.UtcNow
         };
 
